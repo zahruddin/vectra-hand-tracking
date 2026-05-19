@@ -1,0 +1,22 @@
+{
+    "Jempol": {
+        "min": 130,
+        "max": 490
+    },
+    "Telunjuk": {
+        "min": 130,
+        "max": 490
+    },
+    "Tengah": {
+        "min": 130,
+        "max": 490
+    },
+    "Manis": {
+        "min": 130,
+        "max": 490
+    },
+    "Kelingking": {
+        "min": 130,
+        "max": 490
+    }
+}

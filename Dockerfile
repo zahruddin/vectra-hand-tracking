@@ -1,21 +1,17 @@
-# Gunakan image Python ringan
-FROM python:3.10-slim
+FROM python:3.11-slim
 
-# Set working directory
 WORKDIR /app
 
-# Install dependency sistem yang dibutuhkan OpenCV
-RUN apt-get update && apt-get install -y \
-    libgl1-mesa-glx \
-    libglib2.0-0 \
-    && rm -rf /var/lib/apt/lists/*
+ENV PYTHONDONTWRITEBYTECODE=1
+ENV PYTHONUNBUFFERED=1
 
-# Copy file requirements dan install
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
-# Copy sisa kode
-COPY . .
+COPY app.py .
 
-# Jalankan server
-CMD ["python", "homeweb.py"]
+RUN mkdir -p /app/data
+
+EXPOSE 5000
+
+CMD ["python", "app.py"]

@@ -1,0 +1,27 @@
+{
+    "Jempol": {
+        "min": 130,
+        "max": 490,
+        "reverse": false
+    },
+    "Telunjuk": {
+        "min": 130,
+        "max": 490,
+        "reverse": false
+    },
+    "Tengah": {
+        "min": 130,
+        "max": 490,
+        "reverse": false
+    },
+    "Manis": {
+        "min": 130,
+        "max": 490,
+        "reverse": false
+    },
+    "Kelingking": {
+        "min": 130,
+        "max": 490,
+        "reverse": false
+    }
+}

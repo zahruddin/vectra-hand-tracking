@@ -1,19 +1,20 @@
-import eventlet
-eventlet.monkey_patch()
-
 import json
 import os
-import time
 import threading
+import time
 from flask import Flask, render_template_string, request, jsonify
-from flask_socketio import SocketIO, emit
+from flask_socketio import SocketIO
+from flask_sock import Sock
 
-# ==========================================
-# 1. CONFIGURATION & FILE MANAGEMENT
-# ==========================================
+# =====================================================
+# VECTRA / CYBERHAND PYTHON SERVER
+# Browser dashboard  : Socket.IO
+# ESP32 firmware     : Plain WebSocket endpoint /esp32
+# Cloudflare Tunnel  : cloudflared tunnel --url http://localhost:5000
+# =====================================================
+
 JSON_FILE = "calibration.json"
 jari_names = ["Jempol", "Telunjuk", "Tengah", "Manis", "Kelingking"]
-
 default_calibration = {name: {"min": 130, "max": 490} for name in jari_names}
 
 
@@ -23,7 +24,6 @@ def load_calibration():
             with open(JSON_FILE, "r", encoding="utf-8") as f:
                 data = json.load(f)
 
-            # Lengkapi jika ada key yang hilang
             for name in jari_names:
                 if name not in data:
                     data[name] = default_calibration[name].copy()
@@ -31,6 +31,7 @@ def load_calibration():
                     data[name]["min"] = default_calibration[name]["min"]
                 if "max" not in data[name]:
                     data[name]["max"] = default_calibration[name]["max"]
+
             return data
         except Exception as e:
             print(f"⚠️ Gagal membaca calibration.json, pakai default. Error: {e}")
@@ -45,82 +46,131 @@ def save_calibration(data):
 
 calibration_data = load_calibration()
 
-# ==========================================
-# 2. FLASK & SOCKET.IO SETUP
-# ==========================================
 app = Flask(__name__)
 app.config["SECRET_KEY"] = os.environ.get("SECRET_KEY", "vectra_sdmuhla_key")
 
-# Pakai eventlet agar WebSocket stabil di Docker/Cloudflare Tunnel
+# Socket.IO untuk browser/HP
 socketio = SocketIO(
     app,
     cors_allowed_origins="*",
-    async_mode="eventlet",
-    ping_interval=20,
-    ping_timeout=60,
+    async_mode="threading",
 )
 
+# Plain WebSocket untuk ESP32
+sock = Sock(app)
 
-# Status ESP32
-esp32_sid = None
+lock = threading.Lock()
+esp32_ws = None
+esp32_connected = False
 esp32_ip = ""
 esp32_last_seen = 0
-lock = threading.Lock()
 
-# ==========================================
-# 3. SOCKET.IO EVENTS
-# ==========================================
+
+# =====================================================
+# ESP32 PLAIN WEBSOCKET: /esp32
+# =====================================================
+@sock.route("/esp32")
+def esp32_socket(ws):
+    global esp32_ws, esp32_connected, esp32_ip, esp32_last_seen
+
+    with lock:
+        esp32_ws = ws
+        esp32_connected = True
+        esp32_ip = request.remote_addr or "ESP32"
+        esp32_last_seen = time.time()
+
+    print(f"🤖 ESP32 terhubung via plain WebSocket /esp32, IP={esp32_ip}")
+
+    try:
+        ws.send(json.dumps({
+            "type": "registered",
+            "ok": True,
+            "message": "ESP32 WebSocket connected"
+        }))
+
+        while True:
+            msg = ws.receive()
+
+            if msg is None:
+                break
+
+            try:
+                data = json.loads(msg)
+            except Exception:
+                print(f"⚠️ Pesan ESP32 bukan JSON: {msg}")
+                continue
+
+            msg_type = data.get("type")
+
+            with lock:
+                esp32_last_seen = time.time()
+                esp32_connected = True
+
+            if msg_type == "register_esp32":
+                print(f"🤖 ESP32 register: {data}")
+                ws.send(json.dumps({
+                    "type": "registered",
+                    "ok": True
+                }))
+
+            elif msg_type == "ping":
+                ws.send(json.dumps({
+                    "type": "pong",
+                    "server_time": time.time()
+                }))
+
+            else:
+                print(f"ℹ️ Pesan ESP32: {data}")
+
+    except Exception as e:
+        print(f"⚠️ ESP32 WebSocket error: {e}")
+
+    finally:
+        with lock:
+            if esp32_ws is ws:
+                esp32_ws = None
+                esp32_connected = False
+                esp32_ip = ""
+                esp32_last_seen = 0
+
+        print("⚠️ ESP32 WebSocket terputus")
+
+
+def send_to_esp32(payload):
+    global esp32_ws, esp32_connected
+
+    with lock:
+        ws = esp32_ws
+        connected = esp32_connected and ws is not None
+
+    if not connected:
+        return False
+
+    try:
+        ws.send(json.dumps(payload))
+        return True
+    except Exception as e:
+        print(f"⚠️ Gagal kirim ke ESP32: {e}")
+        with lock:
+            esp32_connected = False
+        return False
+
+
+# =====================================================
+# BROWSER SOCKET.IO
+# =====================================================
 @socketio.on("connect")
 def on_connect():
-    print(f"🔗 Client Socket.IO terhubung: SID={request.sid}, IP={request.remote_addr}")
+    print(f"🔗 Browser/Client Socket.IO terhubung: SID={request.sid}, IP={request.remote_addr}")
 
 
 @socketio.on("disconnect")
 def on_disconnect():
-    global esp32_sid, esp32_ip, esp32_last_seen
-    with lock:
-        if request.sid == esp32_sid:
-            print("⚠️ ESP32 terputus dari WebSocket")
-            esp32_sid = None
-            esp32_ip = ""
-            esp32_last_seen = 0
-        else:
-            print(f"ℹ️ Client terputus: SID={request.sid}")
+    print(f"ℹ️ Browser/Client Socket.IO terputus: SID={request.sid}")
 
-
-@socketio.on("register_esp32")
-def register_esp32(data=None):
-    global esp32_sid, esp32_ip, esp32_last_seen
-
-    with lock:
-        esp32_sid = request.sid
-        esp32_ip = request.remote_addr or "ESP32"
-        esp32_last_seen = time.time()
-
-    print(f"🤖 ESP32 terdaftar via WebSocket: SID={esp32_sid}, IP={esp32_ip}, DATA={data}")
-    emit("registered", {"ok": True, "message": "ESP32 registered"})
-
-@socketio.on("esp32_ping")
-def esp32_ping(data=None):
-    global esp32_sid, esp32_ip, esp32_last_seen
-
-    with lock:
-        esp32_sid = request.sid
-        esp32_ip = request.remote_addr or "ESP32"
-        esp32_last_seen = time.time()
-
-    print(f"💓 ESP32 ping: SID={esp32_sid}, IP={esp32_ip}")
-    emit("esp32_pong", {"ok": True})
 
 @socketio.on("send_pulses")
 def handle_pulses_from_phone(data):
-    """
-    Browser HP mengirim data sekitar 30 FPS.
-    Server meneruskan data ke ESP32 melalui event Socket.IO: pulses.
-    Format ke ESP32: {"pulses": [130, 135, 130, 135, 130]}
-    """
-    global esp32_sid
-
     pulses = data.get("pulses", []) if isinstance(data, dict) else []
 
     if len(pulses) != 5:
@@ -131,19 +181,21 @@ def handle_pulses_from_phone(data):
     except Exception:
         return
 
-    # Batasi rentang aman sebelum diteruskan ke ESP32
     pulses = [max(100, min(600, x)) for x in pulses]
 
-    with lock:
-        sid = esp32_sid
+    ok = send_to_esp32({
+        "type": "pulses",
+        "pulses": pulses
+    })
 
-    if sid:
-        socketio.emit("pulses", {"pulses": pulses}, to=sid)
+    if not ok:
+        # Jangan terlalu sering print, tapi berguna saat debugging awal.
+        pass
 
 
-# ==========================================
-# 4. HTML UI
-# ==========================================
+# =====================================================
+# HTML DASHBOARD
+# =====================================================
 HTML_TEMPLATE = """
 <!DOCTYPE html>
 <html lang="id">
@@ -177,9 +229,9 @@ HTML_TEMPLATE = """
         .custom-scrollbar::-webkit-scrollbar { width: 4px; }
         .custom-scrollbar::-webkit-scrollbar-track { background: transparent; }
         .custom-scrollbar::-webkit-scrollbar-thumb { background: #27272a; border-radius: 2px; }
-        .custom-scrollbar::-webkit-scrollbar-thumb:hover { background: #06b6d4; }
     </style>
 </head>
+
 <body class="bg-[#09090b] text-zinc-300 min-h-screen overflow-x-hidden selection:bg-cyan-500/30 selection:text-cyan-50 flex flex-col">
     <div class="max-w-[1400px] w-full mx-auto px-4 py-6 h-screen flex flex-col min-h-0">
         <header class="flex flex-col md:flex-row justify-between items-end mb-6 border-b border-zinc-800 pb-4 gap-4 flex-shrink-0">
@@ -198,14 +250,13 @@ HTML_TEMPLATE = """
             <div class="flex items-center gap-6">
                 <div class="flex items-center gap-2">
                     <span class="text-[10px] text-zinc-500 font-mono uppercase tracking-widest">ESP32</span>
-                    <div id="status_indicator" class="flex items-center gap-2 px-2 py-1 bg-zinc-900 border border-zinc-800 rounded">
+                    <div class="flex items-center gap-2 px-2 py-1 bg-zinc-900 border border-zinc-800 rounded">
                         <span id="status_dot" class="w-1.5 h-1.5 rounded-full bg-rose-500 animate-pulse"></span>
                         <span id="esp32_status" class="text-[10px] font-mono text-zinc-400">WAITING</span>
                     </div>
                 </div>
 
                 <button id="camToggle" onclick="toggleCamera()" class="group relative px-5 py-2 bg-zinc-900 hover:bg-cyan-950 border border-zinc-800 hover:border-cyan-500/50 transition-all rounded">
-                    <div class="absolute inset-0 w-0 bg-cyan-500/10 transition-all duration-300 ease-out group-hover:w-full"></div>
                     <span class="relative text-xs font-mono text-zinc-300 group-hover:text-cyan-400 tracking-widest uppercase flex items-center gap-2">
                         INIT CAMERA
                     </span>
@@ -288,198 +339,197 @@ HTML_TEMPLATE = """
         </div>
     </div>
 
-    <script>
-        const socket = io({ transports: ["websocket", "polling"] });
-        let calData = {{ cal_data | tojson | safe }};
-        const jariNames = ["Jempol", "Telunjuk", "Tengah", "Manis", "Kelingking"];
+<script>
+const socket = io({ transports: ["websocket", "polling"] });
+let calData = {{ cal_data | tojson | safe }};
+const jariNames = ["Jempol", "Telunjuk", "Tengah", "Manis", "Kelingking"];
 
-        let prevAngles = [0, 0, 0, 0, 0];
-        const ALPHA = 0.40;
-        let lastFrameTime = performance.now();
-        let frameCount = 0;
-        let lastEmit = 0;
-        const EMIT_INTERVAL_MS = 33;
+let prevAngles = [0, 0, 0, 0, 0];
+const ALPHA = 0.40;
+let lastFrameTime = performance.now();
+let frameCount = 0;
+let lastEmit = 0;
+const EMIT_INTERVAL_MS = 33;
 
-        const terminalLog = document.getElementById('terminal_log');
-        let logCount = 0;
-        const MAX_LOG_LINES = 25;
+const terminalLog = document.getElementById('terminal_log');
+let logCount = 0;
+const MAX_LOG_LINES = 25;
 
-        socket.on("connect", () => console.log("Socket.IO connected", socket.id));
-        socket.on("disconnect", () => console.log("Socket.IO disconnected"));
+function addLog(pulses) {
+    const now = new Date();
+    const timeStr = now.getSeconds().toString().padStart(2, '0') + '.' + now.getMilliseconds().toString().padStart(3, '0');
+    if (logCount === 0) terminalLog.innerHTML = '';
+    const line = document.createElement('div');
+    line.innerHTML = `<span class="text-zinc-600">[${timeStr}]</span> <span class="text-zinc-500">TX:</span> <span class="text-cyan-400">${pulses.join('<span class="text-zinc-700">,</span> ')}</span>`;
+    terminalLog.prepend(line);
+    logCount++;
+    if (terminalLog.childElementCount > MAX_LOG_LINES) terminalLog.removeChild(terminalLog.lastChild);
+}
 
-        function addLog(pulses) {
-            const now = new Date();
-            const timeStr = now.getSeconds().toString().padStart(2, '0') + '.' + now.getMilliseconds().toString().padStart(3, '0');
-            if (logCount === 0) terminalLog.innerHTML = '';
-            const line = document.createElement('div');
-            line.innerHTML = `<span class="text-zinc-600">[${timeStr}]</span> <span class="text-zinc-500">TX:</span> <span class="text-cyan-400">${pulses.join('<span class="text-zinc-700">,</span> ')}</span>`;
-            terminalLog.prepend(line);
-            logCount++;
-            if (terminalLog.childElementCount > MAX_LOG_LINES) terminalLog.removeChild(terminalLog.lastChild);
+function clearLog() {
+    terminalLog.innerHTML = '<div class="text-zinc-600 italic mt-1">Standby. Menunggu data...</div>';
+    logCount = 0;
+}
+
+function updateCal(jari, type, val) {
+    document.getElementById(jari + "_" + type + "_txt").innerText = val;
+    calData[jari][type] = parseInt(val);
+    fetch('/update', {
+        method: 'POST',
+        headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify({jari: jari, type: type, value: parseInt(val)})
+    });
+}
+
+function mapRange(value, in_min, in_max, out_min, out_max) {
+    value = Math.max(Math.min(value, in_max), in_min);
+    return ((value - in_min) * (out_max - out_min) / (in_max - in_min)) + out_min;
+}
+
+function getJointAngle4Points(p1, p2, p3, p4) {
+    let v1 = {x: p2.x - p1.x, y: p2.y - p1.y, z: p2.z - p1.z};
+    let v2 = {x: p4.x - p3.x, y: p4.y - p3.y, z: p4.z - p3.z};
+    let dotProd = v1.x * v2.x + v1.y * v2.y + v1.z * v2.z;
+    let mag1 = Math.sqrt(v1.x**2 + v1.y**2 + v1.z**2);
+    let mag2 = Math.sqrt(v2.x**2 + v2.y**2 + v2.z**2);
+    if (mag1 * mag2 === 0) return 0;
+    let cosineAngle = Math.max(-1, Math.min(1, dotProd / (mag1 * mag2)));
+    return (Math.acos(cosineAngle) * 180) / Math.PI;
+}
+
+const videoElement = document.getElementById('input_video');
+const canvasElement = document.getElementById('output_canvas');
+const canvasCtx = canvasElement.getContext('2d');
+let cameraStarted = false;
+let cameraObj = null;
+
+function resizeCanvas() {
+    const rect = canvasElement.getBoundingClientRect();
+    canvasElement.width = Math.max(320, Math.floor(rect.width));
+    canvasElement.height = Math.max(240, Math.floor(rect.height));
+}
+window.addEventListener('resize', resizeCanvas);
+
+const hands = new Hands({locateFile: (file) => `https://cdn.jsdelivr.net/npm/@mediapipe/hands/${file}`});
+hands.setOptions({maxNumHands: 1, modelComplexity: 1, minDetectionConfidence: 0.7, minTrackingConfidence: 0.7});
+hands.onResults(onResults);
+
+function onResults(results) {
+    frameCount++;
+    let now = performance.now();
+    if (now - lastFrameTime >= 1000) {
+        document.getElementById('fps_counter').innerText = frameCount + " FPS";
+        frameCount = 0;
+        lastFrameTime = now;
+    }
+
+    canvasCtx.save();
+    canvasCtx.clearRect(0, 0, canvasElement.width, canvasElement.height);
+    canvasCtx.drawImage(results.image, 0, 0, canvasElement.width, canvasElement.height);
+
+    if (results.multiHandLandmarks && results.multiHandLandmarks.length > 0) {
+        const lm = results.multiHandLandmarks[0];
+        drawConnectors(canvasCtx, lm, HAND_CONNECTIONS, {color: 'rgba(6, 182, 212, 0.5)', lineWidth: 2});
+        drawLandmarks(canvasCtx, lm, {color: '#22d3ee', lineWidth: 1, radius: 2});
+
+        let rawAngles = [];
+        let thumbBend1 = getJointAngle4Points(lm[1], lm[2], lm[2], lm[3]);
+        let thumbBend2 = getJointAngle4Points(lm[2], lm[3], lm[3], lm[4]);
+        rawAngles.push(mapRange(thumbBend1 + thumbBend2, 15, 90, 0, 180));
+
+        const fingersData = [[5,6,7,8], [9,10,11,12], [13,14,15,16], [17,18,19,20]];
+        for (let idx of fingersData) {
+            let angle = getJointAngle4Points(lm[idx[0]], lm[idx[1]], lm[idx[2]], lm[idx[3]]);
+            if (lm[idx[3]].y > lm[idx[1]].y && angle > 110) rawAngles.push(180);
+            else rawAngles.push(mapRange(angle, 15, 145, 0, 180));
         }
 
-        function clearLog() {
-            terminalLog.innerHTML = '<div class="text-zinc-600 italic mt-1">Standby. Menunggu data...</div>';
-            logCount = 0;
+        let pulsesToSend = [];
+        for(let i = 0; i < 5; i++) {
+            prevAngles[i] = (ALPHA * rawAngles[i]) + ((1 - ALPHA) * prevAngles[i]);
+            let cMin = calData[jariNames[i]].min;
+            let cMax = calData[jariNames[i]].max;
+            let pulse = cMin + (prevAngles[i] * (cMax - cMin) / 180);
+            pulsesToSend.push(Math.round(pulse));
         }
 
-        function updateCal(jari, type, val) {
-            document.getElementById(jari + "_" + type + "_txt").innerText = val;
-            calData[jari][type] = parseInt(val);
-            fetch('/update', {
-                method: 'POST',
-                headers: {'Content-Type': 'application/json'},
-                body: JSON.stringify({jari: jari, type: type, value: parseInt(val)})
-            });
+        if (now - lastEmit >= EMIT_INTERVAL_MS) {
+            lastEmit = now;
+            socket.emit('send_pulses', {pulses: pulsesToSend});
+            addLog(pulsesToSend);
         }
+    }
+    canvasCtx.restore();
+}
 
-        function mapRange(value, in_min, in_max, out_min, out_max) {
-            value = Math.max(Math.min(value, in_max), in_min);
-            return ((value - in_min) * (out_max - out_min) / (in_max - in_min)) + out_min;
-        }
+function toggleCamera() {
+    const btn = document.getElementById('camToggle');
+    const loading = document.getElementById('loadingAI');
+    const spanText = btn.querySelector('span');
 
-        function getJointAngle4Points(p1, p2, p3, p4) {
-            let v1 = {x: p2.x - p1.x, y: p2.y - p1.y, z: p2.z - p1.z};
-            let v2 = {x: p4.x - p3.x, y: p4.y - p3.y, z: p4.z - p3.z};
-            let dotProd = v1.x * v2.x + v1.y * v2.y + v1.z * v2.z;
-            let mag1 = Math.sqrt(v1.x**2 + v1.y**2 + v1.z**2);
-            let mag2 = Math.sqrt(v2.x**2 + v2.y**2 + v2.z**2);
-            if (mag1 * mag2 === 0) return 0;
-            let cosineAngle = Math.max(-1, Math.min(1, dotProd / (mag1 * mag2)));
-            return (Math.acos(cosineAngle) * 180) / Math.PI;
-        }
+    if(!cameraStarted) {
+        resizeCanvas();
+        loading.classList.remove('hidden');
+        spanText.innerText = "BOOTING...";
 
-        const videoElement = document.getElementById('input_video');
-        const canvasElement = document.getElementById('output_canvas');
-        const canvasCtx = canvasElement.getContext('2d');
-        let cameraStarted = false;
-        let cameraObj = null;
+        const vidWidth = window.innerWidth < 640 ? 480 : 640;
+        const vidHeight = window.innerWidth < 640 ? 640 : 480;
 
-        function resizeCanvas() {
-            const rect = canvasElement.getBoundingClientRect();
-            canvasElement.width = Math.max(320, Math.floor(rect.width));
-            canvasElement.height = Math.max(240, Math.floor(rect.height));
-        }
-        window.addEventListener('resize', resizeCanvas);
-
-        const hands = new Hands({locateFile: (file) => `https://cdn.jsdelivr.net/npm/@mediapipe/hands/${file}`});
-        hands.setOptions({maxNumHands: 1, modelComplexity: 1, minDetectionConfidence: 0.7, minTrackingConfidence: 0.7});
-        hands.onResults(onResults);
-
-        function onResults(results) {
-            frameCount++;
-            let now = performance.now();
-            if (now - lastFrameTime >= 1000) {
-                document.getElementById('fps_counter').innerText = frameCount + " FPS";
-                frameCount = 0;
-                lastFrameTime = now;
-            }
-
-            canvasCtx.save();
-            canvasCtx.clearRect(0, 0, canvasElement.width, canvasElement.height);
-            canvasCtx.drawImage(results.image, 0, 0, canvasElement.width, canvasElement.height);
-
-            if (results.multiHandLandmarks && results.multiHandLandmarks.length > 0) {
-                const lm = results.multiHandLandmarks[0];
-                drawConnectors(canvasCtx, lm, HAND_CONNECTIONS, {color: 'rgba(6, 182, 212, 0.5)', lineWidth: 2});
-                drawLandmarks(canvasCtx, lm, {color: '#22d3ee', lineWidth: 1, radius: 2});
-
-                let rawAngles = [];
-                let thumbBend1 = getJointAngle4Points(lm[1], lm[2], lm[2], lm[3]);
-                let thumbBend2 = getJointAngle4Points(lm[2], lm[3], lm[3], lm[4]);
-                rawAngles.push(mapRange(thumbBend1 + thumbBend2, 15, 90, 0, 180));
-
-                const fingersData = [[5,6,7,8], [9,10,11,12], [13,14,15,16], [17,18,19,20]];
-                for (let idx of fingersData) {
-                    let angle = getJointAngle4Points(lm[idx[0]], lm[idx[1]], lm[idx[2]], lm[idx[3]]);
-                    if (lm[idx[3]].y > lm[idx[1]].y && angle > 110) rawAngles.push(180);
-                    else rawAngles.push(mapRange(angle, 15, 145, 0, 180));
+        cameraObj = new Camera(videoElement, {
+            onFrame: async () => {
+                await hands.send({image: videoElement});
+                if(!loading.classList.contains('hidden')) {
+                    loading.classList.add('hidden');
+                    spanText.innerText = "HALT CAM";
+                    spanText.className = "relative text-xs font-mono text-rose-400 group-hover:text-rose-300 tracking-widest uppercase flex items-center gap-2";
                 }
+            },
+            width: vidWidth,
+            height: vidHeight
+        });
+        cameraObj.start();
+        cameraStarted = true;
+    } else {
+        if (cameraObj) cameraObj.stop();
+        canvasCtx.clearRect(0, 0, canvasElement.width, canvasElement.height);
+        spanText.innerText = "INIT CAMERA";
+        spanText.className = "relative text-xs font-mono text-zinc-300 group-hover:text-cyan-400 tracking-widest uppercase flex items-center gap-2";
+        cameraStarted = false;
+        document.getElementById('fps_counter').innerText = "0 FPS";
+        clearLog();
+    }
+}
 
-                let pulsesToSend = [];
-                for(let i = 0; i < 5; i++) {
-                    prevAngles[i] = (ALPHA * rawAngles[i]) + ((1 - ALPHA) * prevAngles[i]);
-                    let cMin = calData[jariNames[i]].min;
-                    let cMax = calData[jariNames[i]].max;
-                    let pulse = cMin + (prevAngles[i] * (cMax - cMin) / 180);
-                    pulsesToSend.push(Math.round(pulse));
-                }
+async function checkStatus() {
+    try {
+        const res = await fetch('/api/status');
+        const data = await res.json();
+        const dot = document.getElementById('status_dot');
+        const txt = document.getElementById('esp32_status');
 
-                if (now - lastEmit >= EMIT_INTERVAL_MS) {
-                    lastEmit = now;
-                    socket.emit('send_pulses', {pulses: pulsesToSend});
-                    addLog(pulsesToSend);
-                }
-            }
-            canvasCtx.restore();
+        if(data.connected) {
+            dot.className = "w-1.5 h-1.5 rounded-full bg-cyan-400 shadow-[0_0_8px_rgba(34,211,238,0.8)]";
+            txt.innerText = data.ip || "CONNECTED";
+            txt.className = "text-[10px] font-mono text-cyan-400";
+        } else {
+            dot.className = "w-1.5 h-1.5 rounded-full bg-rose-500 animate-pulse";
+            txt.innerText = "WAITING";
+            txt.className = "text-[10px] font-mono text-zinc-500";
         }
+    } catch(e) {}
+}
 
-        function toggleCamera() {
-            const btn = document.getElementById('camToggle');
-            const loading = document.getElementById('loadingAI');
-            const spanText = btn.querySelector('span');
-
-            if(!cameraStarted) {
-                resizeCanvas();
-                loading.classList.remove('hidden');
-                spanText.innerText = "BOOTING...";
-
-                const vidWidth = window.innerWidth < 640 ? 480 : 640;
-                const vidHeight = window.innerWidth < 640 ? 640 : 480;
-
-                cameraObj = new Camera(videoElement, {
-                    onFrame: async () => {
-                        await hands.send({image: videoElement});
-                        if(!loading.classList.contains('hidden')) {
-                            loading.classList.add('hidden');
-                            spanText.innerText = "HALT CAM";
-                            spanText.className = "relative text-xs font-mono text-rose-400 group-hover:text-rose-300 tracking-widest uppercase flex items-center gap-2";
-                        }
-                    },
-                    width: vidWidth,
-                    height: vidHeight
-                });
-                cameraObj.start();
-                cameraStarted = true;
-            } else {
-                if (cameraObj) cameraObj.stop();
-                canvasCtx.clearRect(0, 0, canvasElement.width, canvasElement.height);
-                spanText.innerText = "INIT CAMERA";
-                spanText.className = "relative text-xs font-mono text-zinc-300 group-hover:text-cyan-400 tracking-widest uppercase flex items-center gap-2";
-                cameraStarted = false;
-                document.getElementById('fps_counter').innerText = "0 FPS";
-                clearLog();
-            }
-        }
-
-        async function checkStatus() {
-            try {
-                const res = await fetch('/api/status');
-                const data = await res.json();
-                const dot = document.getElementById('status_dot');
-                const txt = document.getElementById('esp32_status');
-
-                if(data.connected) {
-                    dot.className = "w-1.5 h-1.5 rounded-full bg-cyan-400 shadow-[0_0_8px_rgba(34,211,238,0.8)]";
-                    txt.innerText = data.ip || "CONNECTED";
-                    txt.className = "text-[10px] font-mono text-cyan-400";
-                } else {
-                    dot.className = "w-1.5 h-1.5 rounded-full bg-rose-500 animate-pulse";
-                    txt.innerText = "WAITING";
-                    txt.className = "text-[10px] font-mono text-zinc-500";
-                }
-            } catch(e) {}
-        }
-        setInterval(checkStatus, 2000);
-        checkStatus();
-    </script>
+setInterval(checkStatus, 2000);
+checkStatus();
+</script>
 </body>
 </html>
 """
 
-# ==========================================
-# 5. FLASK ROUTES
-# ==========================================
+
+# =====================================================
+# FLASK ROUTES
+# =====================================================
 @app.route("/")
 def index():
     return render_template_string(HTML_TEMPLATE, jari_names=jari_names, cal_data=calibration_data)
@@ -488,8 +538,8 @@ def index():
 @app.route("/update", methods=["POST"])
 def update_data():
     global calibration_data
-    req = request.get_json(silent=True) or {}
 
+    req = request.get_json(silent=True) or {}
     jari = req.get("jari")
     cal_type = req.get("type")
     value = req.get("value")
@@ -511,15 +561,15 @@ def update_data():
 
 @app.route("/api/status", methods=["GET"])
 def get_status():
-    global esp32_sid, esp32_ip, esp32_last_seen
-
     with lock:
-        connected = esp32_sid is not None and (time.time() - esp32_last_seen) < 10
+        connected = esp32_connected and esp32_ws is not None and (time.time() - esp32_last_seen) < 10
         ip = esp32_ip if connected else ""
 
     return jsonify({
         "connected": connected,
-        "ip": ip
+        "ip": ip,
+        "last_seen": esp32_last_seen if connected else 0,
+        "mode": "plain_websocket"
     })
 
 
@@ -528,11 +578,17 @@ def health():
     return jsonify({"ok": True})
 
 
-# ==========================================
-# 6. MAIN ENTRYPOINT
-# ==========================================
+# =====================================================
+# MAIN
+# =====================================================
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", "5000"))
     print(f"🚀 VECTRA WebSocket Server aktif di port {port}")
     print("🌐 Untuk Cloudflare Tunnel gunakan: cloudflared tunnel --url http://localhost:5000")
-    socketio.run(app, host="0.0.0.0", port=port, debug=False)
+    socketio.run(
+        app,
+        host="0.0.0.0",
+        port=port,
+        debug=False,
+        allow_unsafe_werkzeug=True
+    )

@@ -11,9 +11,20 @@
 // Mode komunikasi:
 // ESP32 -> Python Server menggunakan PLAIN WEBSOCKET
 // Endpoint: ws://host:port/esp32 atau wss://domain:443/esp32
+//
+// Tambahan:
+// - Cek koneksi modul PCA9685 melalui I2C address 0x40
+// - Status PCA tampil di Serial Monitor dan halaman config ESP32
 // =====================================================
 
-Adafruit_PWMServoDriver pwm = Adafruit_PWMServoDriver();
+// Pin I2C default ESP32
+#define I2C_SDA 21
+#define I2C_SCL 22
+
+// Address default PCA9685
+#define PCA9685_ADDR 0x40
+
+Adafruit_PWMServoDriver pwm = Adafruit_PWMServoDriver(PCA9685_ADDR);
 
 // PCA9685 channel mapping:
 // 0 = Jempol, 1 = Telunjuk, 2 = Tengah, 3 = Manis, 4 = Kelingking
@@ -26,6 +37,11 @@ Preferences pref;
 // Plain WebSocket client
 WebSocketsClient webSocket;
 bool websocketConnected = false;
+
+// Status PCA9685
+bool pcaDetected = false;
+bool pcaInitialized = false;
+unsigned long lastPcaCheck = 0;
 
 // Konfigurasi tersimpan di flash
 String wifi_ssid = "";
@@ -48,6 +64,74 @@ unsigned long lastWebSocketReconnectAttempt = 0;
 unsigned long lastStatusPrint = 0;
 unsigned long lastEsp32Ping = 0;
 unsigned long lastServoUpdate = 0;
+
+// =====================================================
+// CEK PCA9685 / I2C
+// =====================================================
+bool checkI2CDevice(uint8_t address) {
+  Wire.beginTransmission(address);
+  byte error = Wire.endTransmission();
+  return (error == 0);
+}
+
+void scanI2CBus() {
+  Serial.println("🔎 Scan I2C bus...");
+  bool foundAny = false;
+
+  for (uint8_t address = 1; address < 127; address++) {
+    Wire.beginTransmission(address);
+    byte error = Wire.endTransmission();
+
+    if (error == 0) {
+      foundAny = true;
+      Serial.print("✅ I2C device ditemukan di address 0x");
+      if (address < 16) Serial.print("0");
+      Serial.println(address, HEX);
+    }
+  }
+
+  if (!foundAny) {
+    Serial.println("❌ Tidak ada device I2C terdeteksi. Cek SDA, SCL, VCC, dan GND.");
+  }
+}
+
+void initPCA9685() {
+  if (!pcaDetected) return;
+
+  Serial.println("⚙️ Inisialisasi PCA9685...");
+  pwm.begin();
+  pwm.setOscillatorFrequency(27000000);
+  pwm.setPWMFreq(50);
+  delay(20);
+
+  for (int i = 0; i < 5; i++) {
+    pwm.setPWM(servoPins[i], 0, (int)currentPulses[i]);
+  }
+
+  pcaInitialized = true;
+  Serial.println("✅ PCA9685 siap. Servo channel 0-4 sudah diberi posisi awal.");
+}
+
+void checkPCA9685Status(bool printAlways = false) {
+  bool nowDetected = checkI2CDevice(PCA9685_ADDR);
+
+  if (nowDetected && !pcaDetected) {
+    pcaDetected = true;
+    Serial.println("✅ PCA9685 TERDETEKSI di I2C address 0x40");
+    initPCA9685();
+  } else if (!nowDetected && pcaDetected) {
+    pcaDetected = false;
+    pcaInitialized = false;
+    Serial.println("❌ PCA9685 TERPUTUS dari I2C address 0x40");
+  } else if (printAlways) {
+    if (nowDetected) {
+      Serial.println("✅ PCA9685 OK di address 0x40");
+    } else {
+      Serial.println("❌ PCA9685 TIDAK TERDETEKSI di address 0x40");
+      Serial.println("   Cek: VCC=3V3, GND common, SDA=GPIO21, SCL=GPIO22.");
+    }
+  }
+}
 
 // =====================================================
 // UTILITAS
@@ -98,6 +182,10 @@ void applyPulseTargets(float pulses[5]) {
   Serial.print(csv);
   Serial.print("  |  ");
   Serial.println(logAngles);
+
+  if (!pcaDetected || !pcaInitialized) {
+    Serial.println("⚠️ Data PWM diterima, tetapi PCA9685 belum terdeteksi. Servo tidak bisa digerakkan.");
+  }
 }
 
 void parsePulsesJson(JsonArray arr) {
@@ -237,6 +325,7 @@ void handleRoot() {
   html += "<p class='text-xs text-gray-400 text-center mb-6'>ESP32 plain WebSocket mode: /esp32</p>";
 
   html += "<div class='bg-gray-950 p-3 rounded-xl border border-gray-800 text-xs space-y-1 mb-6'>";
+
   html += "<div>📶 <span class='text-gray-400'>Status Wi-Fi:</span> <span class='font-bold ";
   html += WiFi.status() == WL_CONNECTED ? "text-green-400" : "text-red-400";
   html += "'>";
@@ -249,6 +338,12 @@ void handleRoot() {
 
   html += "<div>📍 <span class='text-gray-400'>IP Lokal STA:</span> <span class='font-mono text-blue-400'>";
   html += WiFi.localIP().toString();
+  html += "</span></div>";
+
+  html += "<div>🧩 <span class='text-gray-400'>PCA9685:</span> <span class='font-mono ";
+  html += pcaDetected ? "text-green-400" : "text-red-400";
+  html += "'>";
+  html += pcaDetected ? "TERDETEKSI 0x40" : "TIDAK TERDETEKSI";
   html += "</span></div>";
 
   html += "<div>🖥️ <span class='text-gray-400'>Target Server:</span> <span class='font-mono text-yellow-400'>";
@@ -266,6 +361,7 @@ void handleRoot() {
   html += "'>";
   html += websocketConnected ? "TERHUBUNG" : "BELUM TERHUBUNG";
   html += "</span></div>";
+
   html += "</div>";
 
   html += "<form action='/save' method='POST' class='space-y-4'>";
@@ -286,7 +382,11 @@ void handleRoot() {
   html += use_ssl ? "checked" : "";
   html += "> Pakai SSL/WSS untuk Cloudflare Tunnel</label>";
 
-  html += "<p class='text-[11px] text-gray-500 leading-relaxed'>Untuk Cloudflare Tunnel: isi domain saja tanpa https://, port 443, dan centang SSL/WSS.</p>";
+  html += "<p class='text-[11px] text-gray-500 leading-relaxed'>";
+  html += "Untuk Cloudflare Tunnel: isi domain saja tanpa https://, port 443, dan centang SSL/WSS.<br>";
+  html += "PCA9685 wiring: SDA=GPIO21, SCL=GPIO22, VCC=3V3, GND common.";
+  html += "</p>";
+
   html += "<button type='submit' class='w-full bg-blue-600 hover:bg-blue-500 text-white font-bold py-2.5 rounded-lg shadow-lg transition duration-150 mt-2'>Simpan & Terapkan</button>";
   html += "</form></div></body></html>";
 
@@ -343,14 +443,14 @@ void setup() {
   Serial.begin(115200);
   Serial.println("\n=== BOOTING CYBERHAND ESP32 PLAIN WEBSOCKET ===");
 
-  pwm.begin();
-  pwm.setOscillatorFrequency(27000000);
-  pwm.setPWMFreq(50);
-  delay(20);
+  Wire.begin(I2C_SDA, I2C_SCL);
+  Serial.print("🔧 I2C aktif. SDA=GPIO");
+  Serial.print(I2C_SDA);
+  Serial.print(", SCL=GPIO");
+  Serial.println(I2C_SCL);
 
-  for (int i = 0; i < 5; i++) {
-    pwm.setPWM(servoPins[i], 0, (int)currentPulses[i]);
-  }
+  scanI2CBus();
+  checkPCA9685Status(true);
 
   pref.begin("cyberhand", true);
   wifi_ssid = pref.getString("ssid", "");
@@ -393,6 +493,11 @@ void setup() {
 void loop() {
   server.handleClient();
 
+  if (millis() - lastPcaCheck > 5000) {
+    lastPcaCheck = millis();
+    checkPCA9685Status(false);
+  }
+
   if (WiFi.status() == WL_CONNECTED) {
     if (!websocketConnected && millis() - lastWebSocketReconnectAttempt > 5000) {
       lastWebSocketReconnectAttempt = millis();
@@ -415,6 +520,9 @@ void loop() {
     Serial.print("📶 Wi-Fi: ");
     Serial.print(WiFi.status() == WL_CONNECTED ? "OK" : "OFF");
 
+    Serial.print(" | PCA9685: ");
+    Serial.print(pcaDetected ? "OK" : "OFF");
+
     Serial.print(" | WebSocket: ");
     Serial.print(websocketConnected ? "OK" : "OFF");
 
@@ -426,7 +534,7 @@ void loop() {
     Serial.println("/esp32");
   }
 
-  if (millis() - lastServoUpdate >= 10) {
+  if (pcaDetected && pcaInitialized && millis() - lastServoUpdate >= 10) {
     lastServoUpdate = millis();
 
     for (int i = 0; i < 5; i++) {

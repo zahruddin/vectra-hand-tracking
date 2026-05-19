@@ -232,7 +232,6 @@ LOGIN_TEMPLATE = """
         <label class="block text-xs font-bold text-zinc-400 uppercase mb-1">Password</label>
         <input type="password" name="password" autofocus class="w-full bg-zinc-950 border border-zinc-700 rounded-lg px-3 py-2 text-sm text-white focus:outline-none focus:border-cyan-500 mb-4">
         <button type="submit" class="w-full bg-cyan-600 hover:bg-cyan-500 text-white font-bold py-2.5 rounded-lg transition">Masuk</button>
-        <p class="text-[11px] text-zinc-600 mt-4 text-center">Default password: <span class="font-mono">vectra123</span>. Ubah dengan environment <span class="font-mono">VECTRA_PASSWORD</span>.</p>
     </form>
 </body>
 </html>

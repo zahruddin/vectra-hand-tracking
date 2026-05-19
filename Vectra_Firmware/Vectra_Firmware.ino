@@ -132,9 +132,13 @@ void socketIOEvent(socketIOmessageType_t type, uint8_t * payload, size_t length)
 
     case sIOtype_CONNECT:
       socketConnected = true;
-      Serial.println("✅ Socket.IO terhubung ke server Python");
+      Serial.println("✅ Socket.IO transport terhubung ke server Python");
 
-      // Daftarkan diri sebagai ESP32 ke server Python baru
+      // WAJIB untuk masuk ke namespace default Flask-SocketIO "/"
+      socketIO.send(sIOtype_CONNECT, "/");
+      delay(100);
+
+      // Daftarkan diri sebagai ESP32 ke server Python
       socketIO.sendEVENT("[\"register_esp32\",{\"device\":\"CyberHand ESP32\"}]");
       Serial.println("🤖 Mengirim register_esp32 ke server...");
       break;
@@ -336,9 +340,11 @@ void loop() {
   if (WiFi.status() == WL_CONNECTED) {
     socketIO.loop();
 
-    if (!socketConnected && millis() - lastSocketReconnectAttempt > 5000) {
-      lastSocketReconnectAttempt = millis();
-      connectSocketIO();
+    static unsigned long lastEsp32Ping = 0;
+
+    if (socketConnected && millis() - lastEsp32Ping > 3000) {
+      lastEsp32Ping = millis();
+      socketIO.sendEVENT("[\"esp32_ping\",{\"device\":\"CyberHand ESP32\"}]");
     }
   }
 

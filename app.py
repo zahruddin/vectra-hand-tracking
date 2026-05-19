@@ -59,6 +59,7 @@ socketio = SocketIO(
     ping_timeout=60,
 )
 
+
 # Status ESP32
 esp32_sid = None
 esp32_ip = ""
@@ -86,15 +87,27 @@ def on_disconnect():
 
 @socketio.on("register_esp32")
 def register_esp32(data=None):
-    """Dipanggil ESP32 setelah berhasil connect ke Socket.IO."""
-    global esp32_sid, esp32_ip
+    global esp32_sid, esp32_ip, esp32_last_seen
+
     with lock:
         esp32_sid = request.sid
         esp32_ip = request.remote_addr or "ESP32"
+        esp32_last_seen = time.time()
 
     print(f"🤖 ESP32 terdaftar via WebSocket: SID={esp32_sid}, IP={esp32_ip}, DATA={data}")
     emit("registered", {"ok": True, "message": "ESP32 registered"})
 
+@socketio.on("esp32_ping")
+def esp32_ping(data=None):
+    global esp32_sid, esp32_ip, esp32_last_seen
+
+    with lock:
+        esp32_sid = request.sid
+        esp32_ip = request.remote_addr or "ESP32"
+        esp32_last_seen = time.time()
+
+    print(f"💓 ESP32 ping: SID={esp32_sid}, IP={esp32_ip}")
+    emit("esp32_pong", {"ok": True})
 
 @socketio.on("send_pulses")
 def handle_pulses_from_phone(data):
@@ -495,10 +508,16 @@ def update_data():
 
 @app.route("/api/status", methods=["GET"])
 def get_status():
+    global esp32_sid, esp32_ip, esp32_last_seen
+
     with lock:
-        connected = esp32_sid is not None
+        connected = esp32_sid is not None and (time.time() - esp32_last_seen) < 10
         ip = esp32_ip if connected else ""
-    return jsonify({"connected": connected, "ip": ip})
+
+    return jsonify({
+        "connected": connected,
+        "ip": ip
+    })
 
 
 @app.route("/health", methods=["GET"])

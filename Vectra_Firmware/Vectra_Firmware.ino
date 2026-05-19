@@ -58,6 +58,13 @@ bool use_ssl = false;
 // Servo smoothing
 float currentPulses[5] = {130.0, 135.0, 130.0, 135.0, 130.0};
 float targetPulses[5]  = {130.0, 135.0, 130.0, 135.0, 130.0};
+
+// Reverse servo per jari. Nilai ini dikirim dari dashboard Python.
+// Reverse dipakai untuk penempatan servo yang arahnya berkebalikan.
+bool servoReverse[5] = {false, false, false, false, false};
+int servoCalMin[5] = {130, 130, 130, 130, 130};
+int servoCalMax[5] = {490, 490, 490, 490, 490};
+
 const float SMOOTH_FACTOR = 0.15;
 
 unsigned long lastWebSocketReconnectAttempt = 0;
@@ -199,6 +206,61 @@ void parsePulsesJson(JsonArray arr) {
   applyPulseTargets(pulses);
 }
 
+void parseServoConfig(JsonDocument &doc) {
+  bool changed = false;
+
+  if (doc["reverse"].is<JsonArray>()) {
+    JsonArray rev = doc["reverse"].as<JsonArray>();
+    for (int i = 0; i < 5 && i < rev.size(); i++) {
+      servoReverse[i] = rev[i].as<bool>();
+    }
+    changed = true;
+  }
+
+  if (doc["min"].is<JsonArray>()) {
+    JsonArray mn = doc["min"].as<JsonArray>();
+    for (int i = 0; i < 5 && i < mn.size(); i++) {
+      servoCalMin[i] = mn[i].as<int>();
+    }
+    changed = true;
+  }
+
+  if (doc["max"].is<JsonArray>()) {
+    JsonArray mx = doc["max"].as<JsonArray>();
+    for (int i = 0; i < 5 && i < mx.size(); i++) {
+      servoCalMax[i] = mx[i].as<int>();
+    }
+    changed = true;
+  }
+
+  if (changed) {
+    Serial.print("🔁 Reverse config: ");
+    for (int i = 0; i < 5; i++) {
+      Serial.print(servoReverse[i] ? "ON" : "OFF");
+      if (i < 4) Serial.print(", ");
+    }
+    Serial.println();
+  }
+}
+
+void applyAnglesFromServer(JsonArray angles) {
+  if (angles.size() < 5) return;
+
+  float pulses[5];
+  for (int i = 0; i < 5; i++) {
+    float angle = constrain(angles[i].as<float>(), 0.0, 180.0);
+    if (servoReverse[i]) {
+      angle = 180.0 - angle;
+    }
+
+    int cMin = servoCalMin[i];
+    int cMax = servoCalMax[i];
+    pulses[i] = cMin + (angle * (cMax - cMin) / 180.0);
+  }
+
+  applyPulseTargets(pulses);
+}
+
 void parseSerialPulses(String data) {
   float pulses[5] = {130, 135, 130, 135, 130};
   int idx = 0;
@@ -234,7 +296,7 @@ void webSocketEvent(WStype_t type, uint8_t * payload, size_t length) {
       websocketConnected = true;
       Serial.println("✅ WebSocket ESP32 terhubung ke server Python");
 
-      webSocket.sendTXT("{\"type\":\"register_esp32\",\"device\":\"CyberHand ESP32\"}");
+      webSocket.sendTXT("{\"type\":\"register_esp32\",\"device\":\"CyberHand ESP32\",\"firmware\":\"plain_ws_pca_reverse\"}");
       Serial.println("🤖 Mengirim register_esp32 ke server...");
       break;
 
@@ -254,11 +316,23 @@ void webSocketEvent(WStype_t type, uint8_t * payload, size_t length) {
 
       String msgType = doc["type"] | "";
 
+      // Dashboard Python dapat mengirim konfigurasi reverse/min/max bersama data.
+      // Untuk payload type=pulses, pulse sudah final dari server/browser, jadi ESP32 TIDAK membalik lagi agar tidak double reverse.
+      // Reverse akan dipakai jika server mengirim type=angles.
+      parseServoConfig(doc);
+
       if (msgType == "pulses") {
         JsonArray arr = doc["pulses"].as<JsonArray>();
         if (arr.size() >= 5) {
           parsePulsesJson(arr);
         }
+      } else if (msgType == "angles") {
+        JsonArray angles = doc["angles"].as<JsonArray>();
+        if (angles.size() >= 5) {
+          applyAnglesFromServer(angles);
+        }
+      } else if (msgType == "servo_config") {
+        Serial.println("✅ Konfigurasi servo/reverse diterima dari server");
       } else if (msgType == "registered") {
         Serial.println("✅ Server menerima register ESP32");
       } else if (msgType == "pong") {
@@ -508,7 +582,7 @@ void loop() {
 
     if (websocketConnected && millis() - lastEsp32Ping > 3000) {
       lastEsp32Ping = millis();
-      webSocket.sendTXT("{\"type\":\"ping\",\"device\":\"CyberHand ESP32\"}");
+      webSocket.sendTXT(String("{\"type\":\"ping\",\"device\":\"CyberHand ESP32\",\"pca\":") + (pcaDetected ? "true" : "false") + "}");
     }
   } else {
     websocketConnected = false;

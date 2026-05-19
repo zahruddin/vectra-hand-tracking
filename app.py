@@ -2,7 +2,7 @@ import json
 import os
 import threading
 import time
-from flask import Flask, render_template_string, request, jsonify
+from flask import Flask, render_template_string, request, jsonify, session, redirect, url_for
 from flask_socketio import SocketIO
 from flask_sock import Sock
 
@@ -15,7 +15,7 @@ from flask_sock import Sock
 
 JSON_FILE = "calibration.json"
 jari_names = ["Jempol", "Telunjuk", "Tengah", "Manis", "Kelingking"]
-default_calibration = {name: {"min": 130, "max": 490} for name in jari_names}
+default_calibration = {name: {"min": 130, "max": 490, "reverse": False} for name in jari_names}
 
 
 def load_calibration():
@@ -31,6 +31,9 @@ def load_calibration():
                     data[name]["min"] = default_calibration[name]["min"]
                 if "max" not in data[name]:
                     data[name]["max"] = default_calibration[name]["max"]
+                if "reverse" not in data[name]:
+                    data[name]["reverse"] = default_calibration[name]["reverse"]
+                data[name]["reverse"] = bool(data[name]["reverse"])
 
             return data
         except Exception as e:
@@ -48,6 +51,7 @@ calibration_data = load_calibration()
 
 app = Flask(__name__)
 app.config["SECRET_KEY"] = os.environ.get("SECRET_KEY", "vectra_sdmuhla_key")
+VECTRA_PASSWORD = os.environ.get("VECTRA_PASSWORD", "vectra123")
 
 # Socket.IO untuk browser/HP
 socketio = SocketIO(
@@ -112,6 +116,12 @@ def esp32_socket(ws):
                     "type": "registered",
                     "ok": True
                 }))
+                ws.send(json.dumps({
+                    "type": "servo_config",
+                    "reverse": [bool(calibration_data[name].get("reverse", False)) for name in jari_names],
+                    "min": [int(calibration_data[name].get("min", 130)) for name in jari_names],
+                    "max": [int(calibration_data[name].get("max", 490)) for name in jari_names]
+                }))
 
             elif msg_type == "ping":
                 ws.send(json.dumps({
@@ -161,6 +171,9 @@ def send_to_esp32(payload):
 # =====================================================
 @socketio.on("connect")
 def on_connect():
+    if not is_logged_in():
+        print(f"⛔ Socket.IO browser ditolak, belum login: SID={request.sid}, IP={request.remote_addr}")
+        return False
     print(f"🔗 Browser/Client Socket.IO terhubung: SID={request.sid}, IP={request.remote_addr}")
 
 
@@ -183,14 +196,68 @@ def handle_pulses_from_phone(data):
 
     pulses = [max(100, min(600, x)) for x in pulses]
 
+    reverse_flags = [bool(calibration_data[name].get("reverse", False)) for name in jari_names]
+
     ok = send_to_esp32({
         "type": "pulses",
-        "pulses": pulses
+        "pulses": pulses,
+        "reverse": reverse_flags
     })
 
     if not ok:
         # Jangan terlalu sering print, tapi berguna saat debugging awal.
         pass
+
+
+
+# =====================================================
+# SIMPLE PASSWORD LOGIN
+# =====================================================
+LOGIN_TEMPLATE = """
+<!DOCTYPE html>
+<html lang="id">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>VECTRA Login</title>
+    <script src="https://cdn.tailwindcss.com"></script>
+</head>
+<body class="bg-[#09090b] text-zinc-100 min-h-screen flex items-center justify-center p-4">
+    <form method="POST" class="w-full max-w-sm bg-zinc-900 border border-zinc-800 rounded-2xl p-6 shadow-2xl">
+        <h1 class="text-2xl font-black tracking-widest text-cyan-400 text-center mb-1">VECTRA</h1>
+        <p class="text-xs text-zinc-500 text-center mb-6 uppercase tracking-widest">Protected Dashboard</p>
+        {% if error %}
+        <div class="mb-4 text-xs text-rose-300 bg-rose-950/40 border border-rose-800 rounded-lg px-3 py-2">{{ error }}</div>
+        {% endif %}
+        <label class="block text-xs font-bold text-zinc-400 uppercase mb-1">Password</label>
+        <input type="password" name="password" autofocus class="w-full bg-zinc-950 border border-zinc-700 rounded-lg px-3 py-2 text-sm text-white focus:outline-none focus:border-cyan-500 mb-4">
+        <button type="submit" class="w-full bg-cyan-600 hover:bg-cyan-500 text-white font-bold py-2.5 rounded-lg transition">Masuk</button>
+        <p class="text-[11px] text-zinc-600 mt-4 text-center">Default password: <span class="font-mono">vectra123</span>. Ubah dengan environment <span class="font-mono">VECTRA_PASSWORD</span>.</p>
+    </form>
+</body>
+</html>
+"""
+
+
+def is_logged_in():
+    return session.get("vectra_logged_in") is True
+
+
+@app.route("/login", methods=["GET", "POST"])
+def login():
+    if request.method == "POST":
+        password = request.form.get("password", "")
+        if password == VECTRA_PASSWORD:
+            session["vectra_logged_in"] = True
+            return redirect(url_for("index"))
+        return render_template_string(LOGIN_TEMPLATE, error="Password salah."), 401
+    return render_template_string(LOGIN_TEMPLATE, error="")
+
+
+@app.route("/logout")
+def logout():
+    session.clear()
+    return redirect(url_for("login"))
 
 
 # =====================================================
@@ -256,6 +323,8 @@ HTML_TEMPLATE = """
                     </div>
                 </div>
 
+                <a href="/logout" class="text-[10px] font-mono text-zinc-500 hover:text-rose-400 uppercase tracking-widest">Logout</a>
+
                 <button id="camToggle" onclick="toggleCamera()" class="group relative px-5 py-2 bg-zinc-900 hover:bg-cyan-950 border border-zinc-800 hover:border-cyan-500/50 transition-all rounded">
                     <span class="relative text-xs font-mono text-zinc-300 group-hover:text-cyan-400 tracking-widest uppercase flex items-center gap-2">
                         INIT CAMERA
@@ -311,7 +380,7 @@ HTML_TEMPLATE = """
                         <div class="group relative px-4 py-3 rounded-lg bg-zinc-900/50 border border-zinc-800/50 hover:border-zinc-700 transition-colors">
                             <div class="flex flex-col xl:flex-row xl:items-center gap-4">
                                 <span class="text-xs font-mono tracking-widest text-zinc-300 uppercase xl:w-20">{{ name }}</span>
-                                <div class="flex-grow grid grid-cols-2 gap-4">
+                                <div class="flex-grow grid grid-cols-3 gap-4">
                                     <div>
                                         <div class="flex justify-between text-[10px] font-mono text-zinc-500 mb-1.5 uppercase">
                                             <span>MIN</span>
@@ -325,6 +394,15 @@ HTML_TEMPLATE = """
                                             <span class="text-rose-400" id="{{name}}_max_txt">{{cal_data[name]['max']}}</span>
                                         </div>
                                         <input type="range" min="400" max="600" value="{{cal_data[name]['max']}}" class="w-full slider-rose" oninput="updateCal('{{name}}', 'max', this.value)">
+                                    </div>
+                                    <div class="flex flex-col justify-center">
+                                        <div class="flex justify-between text-[10px] font-mono text-zinc-500 mb-1.5 uppercase">
+                                            <span>REVERSE</span>
+                                            <span class="text-amber-400" id="{{name}}_reverse_txt">{{ 'ON' if cal_data[name].get('reverse') else 'OFF' }}</span>
+                                        </div>
+                                        <label class="flex items-center gap-2 text-xs font-mono text-zinc-400 uppercase">
+                                            <input id="{{name}}_reverse_cb" type="checkbox" {% if cal_data[name].get('reverse') %}checked{% endif %} onchange="updateCal('{{name}}', 'reverse', this.checked)" class="w-4 h-4 accent-amber-500"> Balik arah
+                                        </label>
                                     </div>
                                 </div>
                             </div>
@@ -372,12 +450,22 @@ function clearLog() {
 }
 
 function updateCal(jari, type, val) {
-    document.getElementById(jari + "_" + type + "_txt").innerText = val;
-    calData[jari][type] = parseInt(val);
+    let value = val;
+
+    if (type === "reverse") {
+        value = !!val;
+        calData[jari][type] = value;
+        document.getElementById(jari + "_reverse_txt").innerText = value ? "ON" : "OFF";
+    } else {
+        value = parseInt(val);
+        document.getElementById(jari + "_" + type + "_txt").innerText = value;
+        calData[jari][type] = value;
+    }
+
     fetch('/update', {
         method: 'POST',
         headers: {'Content-Type': 'application/json'},
-        body: JSON.stringify({jari: jari, type: type, value: parseInt(val)})
+        body: JSON.stringify({jari: jari, type: type, value: value})
     });
 }
 
@@ -449,7 +537,8 @@ function onResults(results) {
             prevAngles[i] = (ALPHA * rawAngles[i]) + ((1 - ALPHA) * prevAngles[i]);
             let cMin = calData[jariNames[i]].min;
             let cMax = calData[jariNames[i]].max;
-            let pulse = cMin + (prevAngles[i] * (cMax - cMin) / 180);
+            let angleForServo = calData[jariNames[i]].reverse ? (180 - prevAngles[i]) : prevAngles[i];
+            let pulse = cMin + (angleForServo * (cMax - cMin) / 180);
             pulsesToSend.push(Math.round(pulse));
         }
 
@@ -532,6 +621,8 @@ checkStatus();
 # =====================================================
 @app.route("/")
 def index():
+    if not is_logged_in():
+        return redirect(url_for("login"))
     return render_template_string(HTML_TEMPLATE, jari_names=jari_names, cal_data=calibration_data)
 
 
@@ -539,28 +630,44 @@ def index():
 def update_data():
     global calibration_data
 
+    if not is_logged_in():
+        return jsonify({"status": "error", "message": "Unauthorized"}), 401
+
     req = request.get_json(silent=True) or {}
     jari = req.get("jari")
     cal_type = req.get("type")
     value = req.get("value")
 
-    if jari not in calibration_data or cal_type not in ["min", "max"]:
+    if jari not in calibration_data or cal_type not in ["min", "max", "reverse"]:
         return jsonify({"status": "error", "message": "Invalid calibration key"}), 400
 
-    try:
-        value = int(value)
-    except Exception:
-        return jsonify({"status": "error", "message": "Invalid value"}), 400
+    if cal_type == "reverse":
+        value = bool(value)
+    else:
+        try:
+            value = int(value)
+        except Exception:
+            return jsonify({"status": "error", "message": "Invalid value"}), 400
 
     with lock:
         calibration_data[jari][cal_type] = value
         save_calibration(calibration_data)
+
+    send_to_esp32({
+        "type": "servo_config",
+        "reverse": [bool(calibration_data[name].get("reverse", False)) for name in jari_names],
+        "min": [int(calibration_data[name].get("min", 130)) for name in jari_names],
+        "max": [int(calibration_data[name].get("max", 490)) for name in jari_names]
+    })
 
     return jsonify({"status": "success"})
 
 
 @app.route("/api/status", methods=["GET"])
 def get_status():
+    if not is_logged_in():
+        return jsonify({"connected": False, "ip": "", "unauthorized": True}), 401
+
     with lock:
         connected = esp32_connected and esp32_ws is not None and (time.time() - esp32_last_seen) < 10
         ip = esp32_ip if connected else ""

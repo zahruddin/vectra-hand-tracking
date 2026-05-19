@@ -10,3 +10,4 @@ services:
     environment:
       - PYTHONUNBUFFERED=1
       - PORT=5000
+      - VECTRA_PASSWORD=vectra123

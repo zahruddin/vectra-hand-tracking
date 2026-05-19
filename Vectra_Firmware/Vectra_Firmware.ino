@@ -205,9 +205,9 @@ void connectSocketIO() {
 
   // Flask-SocketIO server memakai path default /socket.io/?EIO=4
   if (use_ssl) {
-    socketIO.beginSSL(host.c_str(), server_port, "/socket.io/?EIO=4");
+    socketIO.beginSSL(host.c_str(), server_port, "/socket.io/?EIO=4&transport=websocket");
   } else {
-    socketIO.begin(host.c_str(), server_port, "/socket.io/?EIO=4");
+    socketIO.begin(host.c_str(), server_port, "/socket.io/?EIO=4&transport=websocket");
   }
 
   socketIO.onEvent(socketIOEvent);
@@ -338,6 +338,13 @@ void loop() {
   server.handleClient();
 
   if (WiFi.status() == WL_CONNECTED) {
+    // Mulai koneksi Socket.IO. Di kode sebelumnya fungsi connectSocketIO()
+    // sudah ada, tetapi belum pernah dipanggil dari loop().
+    if (!socketConnected && millis() - lastSocketReconnectAttempt > 5000) {
+      lastSocketReconnectAttempt = millis();
+      connectSocketIO();
+    }
+
     socketIO.loop();
 
     static unsigned long lastEsp32Ping = 0;
@@ -346,6 +353,8 @@ void loop() {
       lastEsp32Ping = millis();
       socketIO.sendEVENT("[\"esp32_ping\",{\"device\":\"CyberHand ESP32\"}]");
     }
+  } else {
+    socketConnected = false;
   }
 
   if (millis() - lastStatusPrint > 10000) {

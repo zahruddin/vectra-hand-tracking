@@ -3,6 +3,7 @@ eventlet.monkey_patch()
 
 import json
 import os
+import time
 import threading
 from flask import Flask, render_template_string, request, jsonify
 from flask_socketio import SocketIO, emit
@@ -63,6 +64,7 @@ socketio = SocketIO(
 # Status ESP32
 esp32_sid = None
 esp32_ip = ""
+esp32_last_seen = 0
 lock = threading.Lock()
 
 # ==========================================
@@ -75,12 +77,13 @@ def on_connect():
 
 @socketio.on("disconnect")
 def on_disconnect():
-    global esp32_sid, esp32_ip
+    global esp32_sid, esp32_ip, esp32_last_seen
     with lock:
         if request.sid == esp32_sid:
             print("⚠️ ESP32 terputus dari WebSocket")
             esp32_sid = None
             esp32_ip = ""
+            esp32_last_seen = 0
         else:
             print(f"ℹ️ Client terputus: SID={request.sid}")
 

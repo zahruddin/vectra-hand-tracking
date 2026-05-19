@@ -1,10 +1,9 @@
-import socket
 import time
 import json
 import os
 import threading
 from flask import Flask, render_template_string, request, jsonify
-from flask_socketio import SocketIO
+from flask_socketio import SocketIO, emit
 
 # ==========================================
 # 1. CONFIGURATION & FILE MANAGEMENT
@@ -24,34 +23,43 @@ def save_calibration(data):
 
 calibration_data = load_calibration()
 
-# TCP Server Setup untuk Komunikasi ke ESP32
-TCP_PORT = 8080
-esp32_client = None
-esp32_address = None
+# WebSocket/Socket.IO Setup untuk Komunikasi HP dan ESP32
+# Tidak ada TCP server lagi. ESP32 menjadi client Socket.IO yang konek keluar ke domain Cloudflare Tunnel.
+esp32_sid = None
+esp32_ip = ""
 lock = threading.Lock()
 
 # Flask & SocketIO Setup
 app = Flask(__name__)
 app.config['SECRET_KEY'] = 'vectra_sdmuhla_key'
-# SocketIO digunakan agar HP bisa mengirim data AI 30 FPS ke Python tanpa lag HTTP
-socketio = SocketIO(app, cors_allowed_origins="*")
+# async_mode=threading supaya mudah jalan di Windows tanpa eventlet/gevent
+socketio = SocketIO(app, cors_allowed_origins="*", async_mode="threading")
 
 # ==========================================
-# 2. TCP SOCKET SERVER BACKGROUND THREAD
+# 2. SOCKET.IO: REGISTRASI ESP32
 # ==========================================
-def tcp_server_loop():
-    global esp32_client, esp32_address
-    server_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    server_socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-    server_socket.bind(('0.0.0.0', TCP_PORT))
-    server_socket.listen(1)
-    
-    while True:
-        client_sock, addr = server_socket.accept()
-        with lock:
-            esp32_client = client_sock
-            esp32_address = addr
-        print(f"🔌 ESP32 Terhubung dari alamat IP: {addr[0]}")
+@socketio.on('connect')
+def on_connect():
+    print(f"🔗 Client Socket.IO terhubung: {request.sid} dari {request.remote_addr}")
+
+@socketio.on('disconnect')
+def on_disconnect():
+    global esp32_sid, esp32_ip
+    with lock:
+        if request.sid == esp32_sid:
+            print("⚠️ ESP32 terputus dari WebSocket")
+            esp32_sid = None
+            esp32_ip = ""
+
+@socketio.on('register_esp32')
+def register_esp32(data=None):
+    """Dipanggil oleh ESP32 setelah berhasil connect ke Socket.IO."""
+    global esp32_sid, esp32_ip
+    with lock:
+        esp32_sid = request.sid
+        esp32_ip = request.remote_addr or "ESP32"
+    print(f"🤖 ESP32 terdaftar via WebSocket: SID={esp32_sid}, IP={esp32_ip}")
+    emit('registered', {'ok': True, 'message': 'ESP32 registered'})
 
 # ==========================================
 # 3. WEBSOCKET: MENERIMA DATA DARI HP & FORWARD KE ESP32
@@ -59,22 +67,26 @@ def tcp_server_loop():
 @socketio.on('send_pulses')
 def handle_pulses_from_phone(data):
     """
-    Fungsi ini dipanggil ~30x per detik oleh browser HP/Klien.
-    Tugasnya murni hanya meneruskan array pulsa langsung ke TCP ESP32.
+    Dipanggil browser HP sekitar 30 FPS.
+    Data langsung diteruskan ke ESP32 melalui Socket.IO, bukan TCP.
+    Format event ke ESP32: pulses -> {"pulses": [130, 135, 130, 135, 130]}
     """
-    global esp32_client
-    pulses = data.get('pulses', [])
-    
-    if len(pulses) == 5:
-        # Convert list of int ke string CSV dengan newline untuk ESP32
-        data_str = ','.join(map(str, pulses)) + '\n'
-        
-        with lock:
-            if esp32_client:
-                try:
-                    esp32_client.send(data_str.encode())
-                except:
-                    esp32_client = None # Reset jika ESP32 tiba-tiba putus
+    global esp32_sid
+    pulses = data.get('pulses', []) if isinstance(data, dict) else []
+
+    if len(pulses) != 5:
+        return
+
+    try:
+        pulses = [int(x) for x in pulses]
+    except Exception:
+        return
+
+    with lock:
+        sid = esp32_sid
+
+    if sid:
+        socketio.emit('pulses', {'pulses': pulses}, to=sid)
 
 # ==========================================
 # 4. TAILWIND + MEDIAPIPE EDGE AI JAVASCRIPT UI (VECTRA BRANDING)
@@ -507,9 +519,10 @@ def update_data():
 
 @app.route('/api/status', methods=['GET'])
 def get_status():
-    global esp32_client, esp32_address
-    connected = esp32_client is not None
-    ip = esp32_address[0] if connected else ""
+    global esp32_sid, esp32_ip
+    with lock:
+        connected = esp32_sid is not None
+        ip = esp32_ip if connected else ""
     return jsonify({"connected": connected, "ip": ip})
 
 if __name__ == '__main__':

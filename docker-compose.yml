@@ -1,0 +1,10 @@
+version: '3.8'
+services:
+  vectra-server:
+    build: .
+    container_name: vectra-ai
+    ports:
+      - "5000:5000"
+    restart: always
+    volumes:
+      - .:/app

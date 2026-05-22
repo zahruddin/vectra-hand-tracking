@@ -86,8 +86,8 @@ Anda dapat mengatur pergerakan setiap jari melalui panel **Actuator Calibration*
 ---
 
 ## 👨‍💻 Kontributor
-- **SD MUHAMMADIYAH LAMONGAN** - *Research & Development*
-- Website: [sdmuhla.sch.id](https://sdmuhla.sch.id)
+- **SD MUHAMMADIYAH LAMONGAN** - *Research & Development* | [sdmuhla.sch.id](https://sdmuhla.sch.id)
+- **Zahruddin Fanani** - *Developer* | [seefan.my.id](https://seefan.my.id)
 
 ---
 *VECTRA is an Open Source Project for Educational Purpose.*

@@ -330,6 +330,13 @@ HTML_TEMPLATE = """
             </div>
 
             <div class="flex items-center gap-6">
+                <div class="flex flex-col items-end gap-1">
+                    <span class="text-[9px] font-mono text-zinc-500 uppercase tracking-widest">Select_Source</span>
+                    <select id="camSelect" class="bg-zinc-900 border border-zinc-800 rounded px-2 py-1 text-[10px] font-mono text-zinc-300 focus:outline-none focus:border-cyan-500/50 w-32">
+                        <option value="">Loading...</option>
+                    </select>
+                </div>
+
                 <div class="flex items-center gap-2">
                     <span class="text-[10px] text-zinc-500 font-mono uppercase tracking-widest">ESP32</span>
                     <div class="flex items-center gap-2 px-2 py-1 bg-zinc-900 border border-zinc-800 rounded">
@@ -502,9 +509,99 @@ function getJointAngle4Points(p1, p2, p3, p4) {
 
 const videoElement = document.getElementById('input_video');
 const canvasElement = document.getElementById('output_canvas');
+const camSelect = document.getElementById('camSelect');
 const canvasCtx = canvasElement.getContext('2d');
+
 let cameraStarted = false;
-let cameraObj = null;
+let activeStream = null;
+let aiActive = false;
+let animationId = null;
+
+async function setupCameraSelection() {
+    try {
+        // Minta izin kamera dulu agar label muncul
+        const stream = await navigator.mediaDevices.getUserMedia({ video: true });
+        stream.getTracks().forEach(track => track.stop()); // Tutup sementara
+
+        const devices = await navigator.mediaDevices.enumerateDevices();
+        const videoDevices = devices.filter(device => device.kind === 'videoinput');
+        
+        camSelect.innerHTML = '';
+        videoDevices.forEach((device, index) => {
+            const option = document.createElement('option');
+            option.value = device.deviceId;
+            option.text = device.label || `Kamera ${index + 1}`;
+            camSelect.appendChild(option);
+        });
+
+        if (videoDevices.length > 0) {
+            await startCamera(videoDevices[0].deviceId);
+        }
+    } catch (e) {
+        console.error("Gagal inisialisasi kamera:", e);
+        camSelect.innerHTML = '<option value="">Akses Kamera Ditolak</option>';
+    }
+}
+
+async function startCamera(deviceId) {
+    if (activeStream) {
+        activeStream.getTracks().forEach(track => track.stop());
+    }
+    
+    try {
+        const constraints = {
+            video: {
+                deviceId: deviceId ? { exact: deviceId } : undefined,
+                width: { ideal: 640 },
+                height: { ideal: 480 }
+            }
+        };
+        
+        activeStream = await navigator.mediaDevices.getUserMedia(constraints);
+        videoElement.srcObject = activeStream;
+        
+        // Tunggu video ready
+        await new Promise((resolve) => {
+            videoElement.onloadedmetadata = () => {
+                videoElement.play();
+                resolve();
+            };
+        });
+
+        resizeCanvas();
+        if (!animationId) startLoop();
+        
+    } catch (e) {
+        console.error("Gagal start camera:", e);
+    }
+}
+
+function startLoop() {
+    async function loop() {
+        if (!activeStream) return;
+        
+        canvasCtx.save();
+        canvasCtx.clearRect(0, 0, canvasElement.width, canvasElement.height);
+        
+        // Gambar feed video ke canvas
+        canvasCtx.drawImage(videoElement, 0, 0, canvasElement.width, canvasElement.height);
+        
+        // Jika AI aktif, proses tangan
+        if (aiActive) {
+            await hands.send({ image: videoElement });
+        }
+        
+        canvasCtx.restore();
+        animationId = requestAnimationFrame(loop);
+    }
+    animationId = requestAnimationFrame(loop);
+}
+
+camSelect.addEventListener('change', async () => {
+    await startCamera(camSelect.value);
+});
+
+setupCameraSelection();
 
 function resizeCanvas() {
     const rect = canvasElement.getBoundingClientRect();
@@ -518,6 +615,8 @@ hands.setOptions({maxNumHands: 1, modelComplexity: 1, minDetectionConfidence: 0.
 hands.onResults(onResults);
 
 function onResults(results) {
+    if (!aiActive) return;
+    
     frameCount++;
     let now = performance.now();
     if (now - lastFrameTime >= 1000) {
@@ -525,10 +624,6 @@ function onResults(results) {
         frameCount = 0;
         lastFrameTime = now;
     }
-
-    canvasCtx.save();
-    canvasCtx.clearRect(0, 0, canvasElement.width, canvasElement.height);
-    canvasCtx.drawImage(results.image, 0, 0, canvasElement.width, canvasElement.height);
 
     if (results.multiHandLandmarks && results.multiHandLandmarks.length > 0) {
         const lm = results.multiHandLandmarks[0];
@@ -563,7 +658,6 @@ function onResults(results) {
             addLog(pulsesToSend);
         }
     }
-    canvasCtx.restore();
 }
 
 function toggleCamera() {
@@ -571,34 +665,24 @@ function toggleCamera() {
     const loading = document.getElementById('loadingAI');
     const spanText = btn.querySelector('span');
 
-    if(!cameraStarted) {
-        resizeCanvas();
+    if(!aiActive) {
         loading.classList.remove('hidden');
         spanText.innerText = "BOOTING...";
-
-        const vidWidth = window.innerWidth < 640 ? 480 : 640;
-        const vidHeight = window.innerWidth < 640 ? 640 : 480;
-
-        cameraObj = new Camera(videoElement, {
-            onFrame: async () => {
-                await hands.send({image: videoElement});
-                if(!loading.classList.contains('hidden')) {
-                    loading.classList.add('hidden');
-                    spanText.innerText = "HALT CAM";
-                    spanText.className = "relative text-xs font-mono text-rose-400 group-hover:text-rose-300 tracking-widest uppercase flex items-center gap-2";
-                }
-            },
-            width: vidWidth,
-            height: vidHeight
-        });
-        cameraObj.start();
-        cameraStarted = true;
+        
+        // Beri jeda sedikit agar UI loading muncul
+        setTimeout(() => {
+            aiActive = true;
+            camSelect.disabled = true;
+            loading.classList.add('hidden');
+            spanText.innerText = "HALT CAM";
+            spanText.className = "relative text-xs font-mono text-rose-400 group-hover:text-rose-300 tracking-widest uppercase flex items-center gap-2";
+        }, 500);
+        
     } else {
-        if (cameraObj) cameraObj.stop();
-        canvasCtx.clearRect(0, 0, canvasElement.width, canvasElement.height);
+        aiActive = false;
+        camSelect.disabled = false;
         spanText.innerText = "INIT CAMERA";
         spanText.className = "relative text-xs font-mono text-zinc-300 group-hover:text-cyan-400 tracking-widest uppercase flex items-center gap-2";
-        cameraStarted = false;
         document.getElementById('fps_counter').innerText = "0 FPS";
         clearLog();
     }
